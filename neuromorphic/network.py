@@ -300,52 +300,92 @@ class Network:
 
     def _apply_stdp_learning_batch(self, current_time, spiked_post_indices):
         """
-        Apply STDP updates to all spiking post neurons in batch.
+        Apply STDP updates to all spiking post neurons in a SINGLE COO batch (fixes both bugs!).
         """
-        for post_idx in spiked_post_indices:
-            self._apply_stdp_learning_single(current_time, post_idx)
-
-    def _apply_stdp_learning_single(self, current_time, post_idx):
-        """
-        Apply STDP updates for a single post-synaptic neuron.
-        """
-        t_post = current_time
-        post_W = self.W.getrow(post_idx)
-        pre_indices = post_W.indices
-        if len(pre_indices) == 0:
+        if len(spiked_post_indices) == 0:
             return
+            
+        # Collect all updates as COO (rows, cols, data)
+        batch_rows = []
+        batch_cols = []
+        batch_w_new = []
         
-        w_old = post_W.data
-        # Get pre_spike_clocks for this post neuron's incoming synapses
-        pre_spikes_row = self.state.pre_spike_clocks.getrow(post_idx)
-        t_pre = pre_spikes_row.data
-        dt_gap = t_post - t_pre
+        for post_idx in spiked_post_indices:
+            # Get both W and pre_spike_clocks as COO for perfect index alignment
+            post_W_coo = self.W.getrow(post_idx).tocoo()
+            post_clocks_coo = self.state.pre_spike_clocks.getrow(post_idx).tocoo()
+            
+            if len(post_W_coo.col) == 0:
+                continue
+                
+            # Create a dict of {col_idx: t_pre} for fast lookup (ensures perfect alignment)
+            pre_to_t = dict(zip(post_clocks_coo.col, post_clocks_coo.data))
+            
+            # Get synapse data
+            pre_indices = post_W_coo.col
+            w_old = post_W_coo.data
+            
+            # Get aligned t_pre (only for columns present in W)
+            t_pre = np.array([pre_to_t.get(pre_idx, -9999.0) for pre_idx in pre_indices])
+            dt_gap = current_time - t_pre
+            
+            # Compute dw and w_new for this post neuron
+            alpha_plus = self.state.alpha_plus[post_idx]
+            alpha_minus = self.state.alpha_minus[post_idx]
+            tau_stdp = self.state.tau_stdp[post_idx]
+            H = self.state.H[post_idx]
+            W_max = self.state.W_max[post_idx]
+            
+            dw = np.zeros_like(w_old)
+            
+            causal_mask = dt_gap > 0
+            dw[causal_mask] = (alpha_plus / (1.0 + H)) * np.exp(-dt_gap[causal_mask] / tau_stdp)
+            
+            anti_causal_mask = dt_gap < 0
+            dw[anti_causal_mask] = -alpha_minus * np.exp(dt_gap[anti_causal_mask] / tau_stdp)
+            
+            zero_mask = dt_gap == 0
+            dw[zero_mask] = (alpha_plus / (1.0 + H))
+            
+            w_new = np.clip(w_old + dw, 0.0, W_max)
+            
+            # Add to batch
+            batch_rows.extend([post_idx] * len(pre_indices))
+            batch_cols.extend(pre_indices)
+            batch_w_new.extend(w_new)
         
-        # Compute dw for all synapses
-        alpha_plus = self.state.alpha_plus[post_idx]
-        alpha_minus = self.state.alpha_minus[post_idx]
-        tau_stdp = self.state.tau_stdp[post_idx]
-        H = self.state.H[post_idx]
-        W_max = self.state.W_max[post_idx]
-        
-        dw = np.zeros_like(w_old)
-        
-        # Causal case (dt_gap > 0)
-        causal_mask = dt_gap > 0
-        dw[causal_mask] = (alpha_plus / (1.0 + H)) * np.exp(-dt_gap[causal_mask] / tau_stdp)
-        
-        # Anti-causal case (dt_gap < 0)
-        anti_causal_mask = dt_gap < 0
-        dw[anti_causal_mask] = -alpha_minus * np.exp(dt_gap[anti_causal_mask] / tau_stdp)
-        
-        # Zero case (dt_gap == 0)
-        zero_mask = dt_gap == 0
-        dw[zero_mask] = (alpha_plus / (1.0 + H))
-        
-        # Update weights in batch
-        w_new = np.clip(w_old + dw, 0.0, W_max)
-        # Update W with new weights
-        self.W[post_idx, pre_indices] = w_new
+        if not batch_rows:
+            return
+            
+        # Batch update W with COO (fast!)
+        batch_coo = sp.coo_matrix(
+            (batch_w_new, (batch_rows, batch_cols)),
+            shape=self.W.shape
+        )
+        self.W = self.W.tocoo()
+        # Use a dict to keep only the latest update per (row, col)
+        update_dict = dict(zip(zip(batch_rows, batch_cols), batch_w_new))
+        # Iterate over W's existing entries and update if needed
+        new_W_data = []
+        new_W_row = []
+        new_W_col = []
+        for r, c, d in zip(self.W.row, self.W.col, self.W.data):
+            if (r, c) in update_dict:
+                new_W_data.append(update_dict.pop((r, c)))
+            else:
+                new_W_data.append(d)
+            new_W_row.append(r)
+            new_W_col.append(c)
+        # Add any new entries (though we shouldn't have any, but just in case)
+        for (r, c), d in update_dict.items():
+            new_W_row.append(r)
+            new_W_col.append(c)
+            new_W_data.append(d)
+        # Reconstruct W as CSR
+        self.W = sp.csr_matrix(
+            (new_W_data, (new_W_row, new_W_col)),
+            shape=self.W.shape
+        )
 
     def simulate(self, duration_ms, external_fn=None):
         """

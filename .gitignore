@@ -17,4 +17,5 @@ wandb/
 runs/
 .DS_Store
 Thumbs.db
+neuromorphic_original/
 
