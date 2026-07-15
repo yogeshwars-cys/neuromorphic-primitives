@@ -1,0 +1,11 @@
+
+numpy>=2.0
+scipy>=1.14
+numba>=0.60
+pytest>=8.0
+hypothesis>=6.100
+pytest-benchmark>=5.0
+pyyaml>=6.0
+h5py>=3.10
+
+
