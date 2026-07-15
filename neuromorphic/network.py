@@ -18,7 +18,7 @@ class Network:
         # State variables
         self.state = NeuronState(0)
         
-        # Sparse weight matrix: W[post_idx, pre_idx] = weight
+        # Sparse weight matrix: W[post_idx, pre_idx] = weight (CSR)
         self.W = sp.csr_matrix((0, 0), dtype=np.float64)
         
         # Ordered list of layers: [ [id, id, ...], [id, id, ...] ]
@@ -29,6 +29,12 @@ class Network:
         
         # Last spike vector (for propagation)
         self.prev_spike_vec = np.zeros(0, dtype=np.int32)
+        
+        # Backward compatibility: dict of Neuron wrappers
+        self.neurons = {}
+    
+    def __len__(self):
+        return len(self.idx_to_id)
 
     # ------------------------------------------------------------------
     # Building the network
@@ -39,54 +45,70 @@ class Network:
         Add a single neuron to the network.
         kwargs are forwarded to NeuronState hyperparameters.
         """
-        if neuron_id in self.id_to_idx:
-            raise ValueError(f"Neuron {neuron_id} already exists in network.")
+        return self.add_neurons([neuron_id], **kwargs)[0]
+    
+    def add_neurons(self, neuron_ids, **kwargs):
+        """
+        Add multiple neurons at once for O(N) construction time.
+        kwargs are forwarded to NeuronState hyperparameters.
+        """
+        # Validate input
+        for nid in neuron_ids:
+            if nid in self.id_to_idx:
+                raise ValueError(f"Neuron {nid} already exists in network.")
         
-        # Grow our structures
-        new_size = len(self.idx_to_id) + 1
-        self.id_to_idx[neuron_id] = new_size - 1
-        self.idx_to_id.append(neuron_id)
+        # Grow structures
+        old_size = len(self.idx_to_id)
+        new_size = old_size + len(neuron_ids)
+        for i, nid in enumerate(neuron_ids):
+            self.id_to_idx[nid] = old_size + i
+            self.idx_to_id.append(nid)
         
-        # Resize state and weight matrix
+        # Resize state
         self.state.resize(new_size)
         
         # Apply custom hyperparameters if provided
-        idx = new_size - 1
-        if 'R_min' in kwargs: self.state.R_min[idx] = kwargs['R_min']
-        if 'lambda_leak' in kwargs: self.state.lambda_leak[idx] = kwargs['lambda_leak']
-        if 'T_base' in kwargs: self.state.T_base[idx] = kwargs['T_base']
-        if 'beta' in kwargs: self.state.beta[idx] = kwargs['beta']
-        if 'gamma' in kwargs: self.state.gamma[idx] = kwargs['gamma']
-        if 'alpha_plus' in kwargs: self.state.alpha_plus[idx] = kwargs['alpha_plus']
-        if 'alpha_minus' in kwargs: self.state.alpha_minus[idx] = kwargs['alpha_minus']
-        if 'tau_stdp' in kwargs: self.state.tau_stdp[idx] = kwargs['tau_stdp']
-        if 'W_max' in kwargs: self.state.W_max[idx] = kwargs['W_max']
+        for i, nid in enumerate(neuron_ids):
+            idx = old_size + i
+            if 'R_min' in kwargs: self.state.R_min[idx] = kwargs['R_min']
+            if 'lambda_leak' in kwargs: self.state.lambda_leak[idx] = kwargs['lambda_leak']
+            if 'T_base' in kwargs: self.state.T_base[idx] = kwargs['T_base']
+            if 'beta' in kwargs: self.state.beta[idx] = kwargs['beta']
+            if 'gamma' in kwargs: self.state.gamma[idx] = kwargs['gamma']
+            if 'alpha_plus' in kwargs: self.state.alpha_plus[idx] = kwargs['alpha_plus']
+            if 'alpha_minus' in kwargs: self.state.alpha_minus[idx] = kwargs['alpha_minus']
+            if 'tau_stdp' in kwargs: self.state.tau_stdp[idx] = kwargs['tau_stdp']
+            if 'W_max' in kwargs: self.state.W_max[idx] = kwargs['W_max']
         
-        # Resize weight matrix (CSR format)
-        if new_size > 1:
-            self.W = sp.vstack([self.W, sp.csr_matrix((1, new_size-1), dtype=np.float64)], format='csr')
-            self.W = sp.hstack([self.W, sp.csr_matrix((new_size, 1), dtype=np.float64)], format='csr')
+        # Resize weight matrix (efficiently via COO)
+        if old_size > 0:
+            old_coo = self.W.tocoo()
+            self.W = sp.csr_matrix(
+                (old_coo.data, (old_coo.row, old_coo.col)),
+                shape=(new_size, new_size)
+            )
         else:
-            self.W = sp.csr_matrix((1, 1), dtype=np.float64)
+            self.W = sp.csr_matrix((new_size, new_size), dtype=np.float64)
         
         # Resize prev_spike_vec
         self.prev_spike_vec = np.zeros(new_size, dtype=np.int32)
         
-        # Initialize spike history
-        self.spike_history[neuron_id] = []
+        # Initialize spike history and Neuron wrappers (backward compatibility)
+        created_neurons = []
+        for nid in neuron_ids:
+            self.spike_history[nid] = []
+            neuron = Neuron(nid, **kwargs)
+            self.neurons[nid] = neuron
+            created_neurons.append(neuron)
         
-        # Return a backward-compatibility Neuron wrapper
-        neuron = Neuron(neuron_id, **kwargs)
-        return neuron
+        return created_neurons
 
     def add_layer(self, neuron_ids, **kwargs):
         """
         Add a group of neurons as a layer.
         Returns the list of Neuron objects created.
         """
-        layer = []
-        for nid in neuron_ids:
-            layer.append(self.add_neuron(nid, **kwargs))
+        layer = self.add_neurons(neuron_ids, **kwargs)
         self.layers.append(neuron_ids)
         return layer
 
@@ -98,36 +120,50 @@ class Network:
             raise ValueError(f"Neuron {pre_id} not in network.")
         if post_id not in self.id_to_idx:
             raise ValueError(f"Neuron {post_id} not in network.")
+        self.connect_batch([(pre_id, post_id, weight)])
+
+    def connect_batch(self, connections):
+        """
+        Add multiple connections at once: list of (pre_id, post_id, weight) tuples.
+        """
+        # Convert ids to indices
+        rows = []
+        cols = []
+        data = []
+        for pre_id, post_id, weight in connections:
+            pre_idx = self.id_to_idx[pre_id]
+            post_idx = self.id_to_idx[post_id]
+            rows.append(post_idx)
+            cols.append(pre_idx)
+            data.append(weight)
         
-        pre_idx = self.id_to_idx[pre_id]
-        post_idx = self.id_to_idx[post_id]
+        # Batch update using COO
+        if not rows:
+            return
+        new_coo = sp.coo_matrix((data, (rows, cols)), shape=self.W.shape)
+        self.W = self.W.tocoo() + new_coo
+        self.W = self.W.tocsr()
+        self.W.eliminate_zeros()
         
-        # Update sparse matrix
-        self.W[post_idx, pre_idx] = weight
+        # Also initialize pre_spike_clocks entries to -9999
+        new_clocks_coo = sp.coo_matrix(
+            (np.full(len(data), -9999.0), (rows, cols)),
+            shape=self.W.shape
+        )
+        self.state.pre_spike_clocks = self.state.pre_spike_clocks.tocoo() + new_clocks_coo
+        self.state.pre_spike_clocks = self.state.pre_spike_clocks.tocsr()
+        self.state.pre_spike_clocks.eliminate_zeros()
 
     def connect_layers(self, from_layer_ids, to_layer_ids, weight=0.3):
         """
         Fully connect every neuron in from_layer to every neuron in to_layer.
         """
-        # Collect indices
-        from_indices = [self.id_to_idx[nid] for nid in from_layer_ids]
-        to_indices = [self.id_to_idx[nid] for nid in to_layer_ids]
-        
-        # Create COO matrix for batch insertion
-        rows = []
-        cols = []
-        data = []
-        for to_idx in to_indices:
-            for from_idx in from_indices:
-                rows.append(to_idx)
-                cols.append(from_idx)
-                data.append(weight)
-        
-        # Build COO and add to existing W
-        if rows:
-            coo = sp.coo_matrix((data, (rows, cols)), shape=self.W.shape)
-            self.W = self.W.tocsr() + coo.tocsr()
-            self.W.eliminate_zeros()
+        # Collect all connections and batch add them
+        connections = []
+        for pre_id in from_layer_ids:
+            for post_id in to_layer_ids:
+                connections.append((pre_id, post_id, weight))
+        self.connect_batch(connections)
 
     # ------------------------------------------------------------------
     # Running the simulation
@@ -148,22 +184,8 @@ class Network:
         if isinstance(external_pulses, (list, set)):
             external_pulses = {nid: [] for nid in external_pulses}
         
-        # 0. Update incoming firing clocks
-        for nid, pre_ids in external_pulses.items():
-            if nid not in self.id_to_idx:
-                continue
-            post_idx = self.id_to_idx[nid]
-            for pre_id in pre_ids:
-                if pre_id not in self.id_to_idx:
-                    continue
-                pre_idx = self.id_to_idx[pre_id]
-                self.state.pre_spike_clocks[post_idx, pre_idx] = current_time
-        
-        # Also update from previous spike vec
-        for pre_idx in np.where(self.prev_spike_vec == 1)[0]:
-            for post_idx in range(N):
-                if self.W[post_idx, pre_idx] > 0:
-                    self.state.pre_spike_clocks[post_idx, pre_idx] = current_time
+        # 0. Update incoming firing clocks (vectorized, no Python loops!)
+        self._update_pre_spike_clocks(current_time, external_pulses)
         
         # 1. Calculate adaptive refractory period
         num_connections = np.array(self.W.getnnz(axis=1))  # per-neuron incoming connections
@@ -210,8 +232,7 @@ class Network:
         self.state.U[not_spiked_indices] *= 0.95
         
         # 7. Apply STDP learning to spiking neurons
-        for post_idx in spiked_indices:
-            self._apply_stdp_learning_single(current_time, post_idx)
+        self._apply_stdp_learning_batch(current_time, spiked_indices)
         
         # Update spike history
         tick_results = {}
@@ -222,9 +243,72 @@ class Network:
         
         self.prev_spike_vec = new_spike_vec
         return tick_results
+    
+    def _update_pre_spike_clocks(self, current_time, external_pulses):
+        """
+        Vectorized update of pre_spike_clocks:
+          1. From external_pulses
+          2. From previous spike vector (sparse matrix-based, no Python loops)
+        """
+        N = len(self.idx_to_id)
+        
+        # 1. Update from external_pulses
+        if external_pulses:
+            ext_rows = []
+            ext_cols = []
+            for post_id, pre_ids in external_pulses.items():
+                if post_id not in self.id_to_idx:
+                    continue
+                post_idx = self.id_to_idx[post_id]
+                for pre_id in pre_ids:
+                    if pre_id not in self.id_to_idx:
+                        continue
+                    pre_idx = self.id_to_idx[pre_id]
+                    ext_rows.append(post_idx)
+                    ext_cols.append(pre_idx)
+            
+            if ext_rows:
+                ext_updates = sp.csr_matrix(
+                    (np.full(len(ext_rows), current_time), (ext_rows, ext_cols)),
+                    shape=(N, N)
+                )
+                # Use maximum to keep the latest time in case of duplicates
+                self.state.pre_spike_clocks = self.state.pre_spike_clocks.maximum(ext_updates)
+        
+        # 2. Update from previous spike vector: W @ spike_vec is O(N + nnz), no Python loops!
+        # Get all pre indices that spiked
+        spiked_pre_indices = np.where(self.prev_spike_vec == 1)[0]
+        if len(spiked_pre_indices) == 0:
+            return
+        
+        # For each spiked pre, update all post neurons connected to it
+        # Use CSC for fast column slicing
+        W_csc = self.W.tocsc()
+        for pre_idx in spiked_pre_indices:
+            col = W_csc[:, pre_idx]
+            if col.nnz > 0:
+                post_indices = col.indices
+                # Build update matrix
+                update_rows = post_indices
+                update_cols = np.full_like(post_indices, pre_idx)
+                update_data = np.full_like(post_indices, current_time, dtype=np.float64)
+                update = sp.csr_matrix(
+                    (update_data, (update_rows, update_cols)),
+                    shape=(N, N)
+                )
+                self.state.pre_spike_clocks = self.state.pre_spike_clocks.maximum(update)
+
+    def _apply_stdp_learning_batch(self, current_time, spiked_post_indices):
+        """
+        Apply STDP updates to all spiking post neurons in batch.
+        """
+        for post_idx in spiked_post_indices:
+            self._apply_stdp_learning_single(current_time, post_idx)
 
     def _apply_stdp_learning_single(self, current_time, post_idx):
-        """Apply STDP updates for a single post-synaptic neuron."""
+        """
+        Apply STDP updates for a single post-synaptic neuron.
+        """
         t_post = current_time
         post_W = self.W.getrow(post_idx)
         pre_indices = post_W.indices
@@ -232,7 +316,9 @@ class Network:
             return
         
         w_old = post_W.data
-        t_pre = self.state.pre_spike_clocks[post_idx, pre_indices]
+        # Get pre_spike_clocks for this post neuron's incoming synapses
+        pre_spikes_row = self.state.pre_spike_clocks.getrow(post_idx)
+        t_pre = pre_spikes_row.data
         dt_gap = t_post - t_pre
         
         # Compute dw for all synapses
@@ -256,8 +342,9 @@ class Network:
         zero_mask = dt_gap == 0
         dw[zero_mask] = (alpha_plus / (1.0 + H))
         
-        # Update weights
+        # Update weights in batch
         w_new = np.clip(w_old + dw, 0.0, W_max)
+        # Update W with new weights
         self.W[post_idx, pre_indices] = w_new
 
     def simulate(self, duration_ms, external_fn=None):

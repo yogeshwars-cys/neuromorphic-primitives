@@ -17,6 +17,11 @@ def save_network(network: Network, file_path: str):
 
 
 def _save_npz(network: Network, file_path: str):
+    # Save W as CSR
+    w_coo = network.W.tocoo()
+    # Save pre_spike_clocks as CSR
+    pre_coo = network.state.pre_spike_clocks.tocoo()
+    
     np.savez_compressed(
         file_path,
         id_to_idx=network.id_to_idx,
@@ -36,18 +41,21 @@ def _save_npz(network: Network, file_path: str):
         alpha_minus=network.state.alpha_minus,
         tau_stdp=network.state.tau_stdp,
         W_max=network.state.W_max,
-        pre_spike_clocks=network.state.pre_spike_clocks,
-        W_data=network.W.data,
-        W_indices=network.W.indices,
+        W_data=w_coo.data,
+        W_indices=w_coo.indices,
         W_indptr=network.W.indptr,
-        W_shape=network.W.shape,
-        format_version='1.0'
+        W_shape=w_coo.shape,
+        pre_data=pre_coo.data,
+        pre_indices=pre_coo.indices,
+        pre_indptr=network.state.pre_spike_clocks.indptr,
+        pre_shape=pre_coo.shape,
+        format_version='1.1'
     )
 
 
 def _save_h5(network: Network, file_path: str):
     with h5py.File(file_path, 'w') as f:
-        f.attrs['format_version'] = '1.0'
+        f.attrs['format_version'] = '1.1'
         f.create_dataset('idx_to_id', data=np.array(network.idx_to_id, dtype=h5py.string_dtype()))
         f.create_dataset('layers', data=np.array(network.layers, dtype=h5py.string_dtype()))
         # Save spike history
@@ -59,13 +67,20 @@ def _save_h5(network: Network, file_path: str):
         for attr in ['charge', 'H', 'U', 'last_spike_time', 'R_min', 'lambda_leak', 
                      'T_base', 'beta', 'gamma', 'alpha_plus', 'alpha_minus', 'tau_stdp', 'W_max']:
             state_group.create_dataset(attr, data=getattr(network.state, attr))
-        state_group.create_dataset('pre_spike_clocks', data=network.state.pre_spike_clocks)
+        # Save pre_spike_clocks as CSR
+        pre_group = state_group.create_group('pre_spike_clocks')
+        pre_coo = network.state.pre_spike_clocks.tocoo()
+        pre_group.create_dataset('data', data=pre_coo.data)
+        pre_group.create_dataset('indices', data=pre_coo.indices)
+        pre_group.create_dataset('indptr', data=network.state.pre_spike_clocks.indptr)
+        pre_group.attrs['shape'] = pre_coo.shape
         # Save sparse weight matrix
         w_group = f.create_group('W')
-        w_group.create_dataset('data', data=network.W.data)
-        w_group.create_dataset('indices', data=network.W.indices)
+        w_coo = network.W.tocoo()
+        w_group.create_dataset('data', data=w_coo.data)
+        w_group.create_dataset('indices', data=w_coo.indices)
         w_group.create_dataset('indptr', data=network.W.indptr)
-        w_group.attrs['shape'] = network.W.shape
+        w_group.attrs['shape'] = w_coo.shape
 
 
 def load_network(file_path: str) -> Network:
@@ -92,12 +107,34 @@ def _load_npz(file_path: str) -> Network:
     for attr in ['charge', 'H', 'U', 'last_spike_time', 'R_min', 'lambda_leak', 
                  'T_base', 'beta', 'gamma', 'alpha_plus', 'alpha_minus', 'tau_stdp', 'W_max']:
         setattr(net.state, attr, data[attr])
-    net.state.pre_spike_clocks = data['pre_spike_clocks']
-    
+    # Restore pre_spike_clocks
+    if 'pre_data' in data:
+        net.state.pre_spike_clocks = sp.csr_matrix(
+            (data['pre_data'], data['pre_indices'], data['pre_indptr']),
+            shape=tuple(data['pre_shape'])
+        )
     # Restore weight matrix
-    net.W = sp.csr_matrix((data['W_data'], data['W_indices'], data['W_indptr']), 
-                         shape=tuple(data['W_shape']))
+    net.W = sp.csr_matrix(
+        (data['W_data'], data['W_indices'], data['W_indptr']),
+        shape=tuple(data['W_shape'])
+    )
     net.prev_spike_vec = np.zeros(N, dtype=np.int32)
+    
+    # Recreate neurons dict for backward compatibility
+    for nid in net.idx_to_id:
+        idx = net.id_to_idx[nid]
+        kwargs = {
+            'R_min': net.state.R_min[idx],
+            'lambda_leak': net.state.lambda_leak[idx],
+            'T_base': net.state.T_base[idx],
+            'beta': net.state.beta[idx],
+            'gamma': net.state.gamma[idx],
+            'alpha_plus': net.state.alpha_plus[idx],
+            'alpha_minus': net.state.alpha_minus[idx],
+            'tau_stdp': net.state.tau_stdp[idx],
+            'W_max': net.state.W_max[idx],
+        }
+        net.neurons[nid] = type(net.neurons[nid])(nid, **kwargs)
     
     return net
 
@@ -117,12 +154,36 @@ def _load_h5(file_path: str) -> Network:
         for attr in ['charge', 'H', 'U', 'last_spike_time', 'R_min', 'lambda_leak', 
                      'T_base', 'beta', 'gamma', 'alpha_plus', 'alpha_minus', 'tau_stdp', 'W_max']:
             setattr(net.state, attr, f['state'][attr][:])
-        net.state.pre_spike_clocks = f['state']['pre_spike_clocks'][:]
-        
+        # Restore pre_spike_clocks
+        if 'pre_spike_clocks' in f['state']:
+            pre_group = f['state']['pre_spike_clocks']
+            net.state.pre_spike_clocks = sp.csr_matrix(
+                (pre_group['data'][:], pre_group['indices'][:], pre_group['indptr'][:]),
+                shape=tuple(pre_group.attrs['shape'])
+            )
+        # Restore weight matrix
         w_group = f['W']
-        net.W = sp.csr_matrix((w_group['data'][:], w_group['indices'][:], w_group['indptr'][:]), 
-                             shape=tuple(w_group.attrs['shape']))
+        net.W = sp.csr_matrix(
+            (w_group['data'][:], w_group['indices'][:], w_group['indptr'][:]),
+            shape=tuple(w_group.attrs['shape'])
+        )
         net.prev_spike_vec = np.zeros(N, dtype=np.int32)
+        
+        # Recreate neurons dict for backward compatibility
+        for nid in net.idx_to_id:
+            idx = net.id_to_idx[nid]
+            kwargs = {
+                'R_min': net.state.R_min[idx],
+                'lambda_leak': net.state.lambda_leak[idx],
+                'T_base': net.state.T_base[idx],
+                'beta': net.state.beta[idx],
+                'gamma': net.state.gamma[idx],
+                'alpha_plus': net.state.alpha_plus[idx],
+                'alpha_minus': net.state.alpha_minus[idx],
+                'tau_stdp': net.state.tau_stdp[idx],
+                'W_max': net.state.W_max[idx],
+            }
+            net.neurons[nid] = type(net.neurons[nid])(nid, **kwargs)
         
         return net
 

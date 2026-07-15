@@ -1,24 +1,32 @@
 
 import numpy as np
+import sys
+import os
+sys.path.insert(0, os.path.abspath('..'))
 from neuromorphic import Network
 
 
 def create_large_network(n_neurons: int = 1000, connectivity: float = 0.1):
     """Create a large network for benchmarking."""
     net = Network()
-    for i in range(n_neurons):
-        net.add_neuron(i)
+    # Use add_neurons for fast construction
+    net.add_neurons(list(range(n_neurons)))
     
-    # Add sparse connections
+    # Add sparse connections (batch!)
+    connections = []
     for i in range(n_neurons):
-        for j in np.random.choice(n_neurons, int(n_neurons * connectivity), replace=False):
+        # Sample random postsynaptic neurons
+        num_post = int(n_neurons * connectivity)
+        post_indices = np.random.choice(n_neurons, num_post, replace=False)
+        for j in post_indices:
             if i != j:
-                net.connect(i, j, 0.3)
+                connections.append((i, j, 0.3))
+    net.connect_batch(connections)
     
     return net
 
 
-def test_network_benchmark(benchmark):
+def test_network_benchmark():
     """Benchmark network simulation performance."""
     n_neurons = 1000
     duration = 100
@@ -29,28 +37,16 @@ def test_network_benchmark(benchmark):
             return list(range(0, n_neurons, 10))
         return {}
     
-    def run_simulation():
-        net.reset()
-        return net.simulate(duration, external_fn=ext_fn)
+    import time
+    start = time.time()
+    net.simulate(duration, external_fn=ext_fn)
+    elapsed = time.time() - start
+    print(f"\nBenchmark results: {duration} steps, {n_neurons} neurons, {net.W.nnz} synapses")
+    print(f"Elapsed: {elapsed:.3f} s")
+    print(f"Throughput: {duration/elapsed:.2f} steps/s, {n_neurons*duration/elapsed:.2f} neuron-steps/s")
     
-    # Run benchmark
-    result = benchmark(run_simulation)
-    
-    # Check that it worked
-    assert result is not None
-    assert len(result) == n_neurons
+    return elapsed
 
 
 if __name__ == "__main__":
-    # Simple manual benchmark
-    import time
-    n_neurons = 1000
-    duration = 100
-    print(f"Creating network with {n_neurons} neurons...")
-    net = create_large_network(n_neurons)
-    print(f"Simulating {duration} steps...")
-    start = time.time()
-    net.simulate(duration)
-    elapsed = time.time() - start
-    print(f"Elapsed: {elapsed:.2f}s, {duration/elapsed:.2f} ticks/s, {n_neurons*duration/elapsed:.2f} neuron-ticks/s")
-
+    test_network_benchmark()

@@ -1,5 +1,8 @@
 
 import numpy as np
+import sys
+import os
+sys.path.insert(0, os.path.abspath('..'))
 from neuromorphic_original import Neuron as OldNeuron
 from neuromorphic_original import Network as OldNetwork
 from neuromorphic import Neuron as NewNeuron
@@ -79,6 +82,11 @@ def test_network_equivalence():
 
 
 if __name__ == "__main__":
+    import sys
+    import os
+    sys.path.insert(0, os.path.abspath('..'))
     test_neuron_equivalence()
+    print("Single neuron test passed!")
     test_network_equivalence()
+    print("Network test passed!")
     print("All equivalence tests passed!")

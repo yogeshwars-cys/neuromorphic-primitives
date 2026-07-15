@@ -1,6 +1,7 @@
 
 import numpy as np
 import math
+import scipy.sparse as sp
 
 try:
     from numba import njit
@@ -13,7 +14,7 @@ except ImportError:
 
 class NeuronState:
     """
-    Structure-of-arrays container for all neuron state variables.
+    Structure-of-Arrays container for all neuron state variables.
     """
     def __init__(self, size: int, **kwargs):
         # State variables
@@ -33,14 +34,15 @@ class NeuronState:
         self.tau_stdp = np.full(size, kwargs.get('tau_stdp', 20.0), dtype=np.float64)
         self.W_max = np.full(size, kwargs.get('W_max', 2.0), dtype=np.float64)
         
-        # Pre-synaptic spike clocks: matrix of shape (N, N)
-        self.pre_spike_clocks = np.full((size, size), -9999.0, dtype=np.float64)
+        # Pre-synaptic spike clocks: CSR sparse matrix matching W's pattern
+        self.pre_spike_clocks = sp.csr_matrix((size, size), dtype=np.float64)
     
     def resize(self, new_size: int):
         """Grow all arrays to new_size"""
         if new_size <= len(self.charge):
             return
         
+        old_size = len(self.charge)
         for attr in ['charge', 'H', 'U', 'last_spike_time', 
                      'R_min', 'lambda_leak', 'T_base', 'beta', 
                      'gamma', 'alpha_plus', 'alpha_minus', 'tau_stdp', 'W_max']:
@@ -65,10 +67,15 @@ class NeuronState:
                 new_arr[len(arr):] = val
             setattr(self, attr, new_arr)
         
-        # Resize pre_spike_clocks matrix
-        old_size = self.pre_spike_clocks.shape[0]
-        new_pre_spike = np.full((new_size, new_size), -9999.0, dtype=np.float64)
-        new_pre_spike[:old_size, :old_size] = self.pre_spike_clocks
+        # Resize pre_spike_clocks matrix (sparse, grow without copying)
+        new_pre_spike = sp.csr_matrix((new_size, new_size), dtype=np.float64)
+        if old_size > 0:
+            # Copy existing non-zeros
+            coo = self.pre_spike_clocks.tocoo()
+            new_pre_spike = sp.csr_matrix(
+                (coo.data, (coo.row, coo.col)),
+                shape=(new_size, new_size)
+            )
         self.pre_spike_clocks = new_pre_spike
 
 
