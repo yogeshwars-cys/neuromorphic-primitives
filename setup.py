@@ -4,7 +4,7 @@ setup(
     name="neuromorphic",
     version="0.2.0",
     description="An autonomous neuromorphic computing primitive with ML-inspired infrastructure",
-    author="Your Name",
+    author="Yogeshwar",
     packages=find_packages(),
     install_requires=[
         "numpy>=2.0",
