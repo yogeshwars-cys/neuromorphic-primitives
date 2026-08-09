@@ -45,7 +45,7 @@ def test_network_benchmark():
     print(f"Elapsed: {elapsed:.3f} s")
     print(f"Throughput: {duration/elapsed:.2f} steps/s, {n_neurons*duration/elapsed:.2f} neuron-steps/s")
     
-    assert elapsed > 0  # pytest test functions shouldn't return a value (was: return elapsed)
+    return elapsed
 
 
 if __name__ == "__main__":

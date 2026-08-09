@@ -5,13 +5,6 @@ import hypothesis.strategies as st
 from neuromorphic import Network, NeuronConfig
 
 
-@hyp.settings(deadline=None)  # this test runs a real numerical simulation each
-                               # example, not a cheap pure computation -- Hypothesis's
-                               # default 200ms wall-clock deadline flags normal system
-                               # jitter as a failure and has nothing to do with
-                               # correctness. Now that external_fn's list-form pulses
-                               # actually drive the network (see network.py fix),
-                               # runtime legitimately varies more with activity level.
 @hyp.given(
     n_neurons=st.integers(min_value=1, max_value=50),
     duration=st.integers(min_value=1, max_value=100),
